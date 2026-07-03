@@ -1,0 +1,4 @@
+playwright>=1.44
+httpx>=0.27
+anthropic>=0.34
+python-dotenv>=1.0
