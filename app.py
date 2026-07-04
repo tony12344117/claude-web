@@ -10,7 +10,7 @@ from pathlib import Path
 
 import streamlit as st
 
-from analyzer import scrape_site, generate_output, save_result
+from analyzer import log, scrape_site, generate_output, save_result
 
 st.set_page_config(page_title="웹사이트 분석기", page_icon="🔍", layout="wide")
 
@@ -88,9 +88,12 @@ analyze_clicked = st.button("분석하기", type="primary")
 
 def run_pipeline(url: str, instruction: str) -> tuple[str, str, Path]:
     with st.status("스크래핑 중...", expanded=True) as status:
-        raw_content = asyncio.run(scrape_site(url))
-        status.update(label="분석 중...")
-        result = generate_output(raw_content, instruction)
+        def progress(message: str) -> None:
+            status.update(label=message)
+            log(message)
+
+        raw_content = asyncio.run(scrape_site(url, on_progress=progress))
+        result = generate_output(raw_content, instruction, on_progress=progress)
         path = save_result(result)
         status.update(label="완료", state="complete")
     file_content = path.read_text(encoding="utf-8")
