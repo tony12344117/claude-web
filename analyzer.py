@@ -44,6 +44,7 @@ CODE_GEN_PROMPT = """당신은 웹 데이터 추출 및 코드 생성 전문가�
 """
 
 CODE_FENCE_PATTERN = re.compile(r"```([a-zA-Z0-9_+-]*)\n(.*?)```", re.DOTALL)
+THINK_TAG_PATTERN = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
 LANGUAGE_EXTENSIONS = {
     "python": "py",
@@ -104,22 +105,38 @@ async def scrape_site(url: str) -> str:
     return markdown
 
 
+def _chat(prompt: str) -> str:
+    messages = [{"role": "user", "content": prompt}]
+
+    try:
+        try:
+            # qwen3 계열처럼 hybrid thinking을 지원하는 모델은 think=False로 꺼야
+            # 답변이 content가 아닌 thinking 필드로만 나오는 것을 막을 수 있다.
+            response = ollama.chat(model=OLLAMA_MODEL, messages=messages, think=False)
+        except TypeError:
+            # 설치된 ollama 라이브러리 버전이 think 파라미터를 지원하지 않는 경우.
+            response = ollama.chat(model=OLLAMA_MODEL, messages=messages)
+    except Exception as exc:
+        raise RuntimeError(f"Ollama 요청에 실패했습니다: {exc}")
+
+    message = response.get("message", {})
+    content = THINK_TAG_PATTERN.sub("", (message.get("content") or "")).strip()
+    if not content:
+        # think=False가 무시되는 모델의 경우, 답변이 thinking 필드에만 담겨 올 수 있다.
+        content = (message.get("thinking") or "").strip()
+    return content
+
+
 def analyze_content(content: str) -> str:
     log("Ollama로 분석 중...")
 
     truncated = content[:MAX_ANALYSIS_CHARS]
-
-    try:
-        response = ollama.chat(
-            model=OLLAMA_MODEL,
-            messages=[{"role": "user", "content": ANALYSIS_PROMPT.format(content=truncated)}],
-        )
-    except Exception as exc:
-        raise RuntimeError(f"Ollama 분석에 실패했습니다: {exc}")
-
-    analysis = response.get("message", {}).get("content", "").strip()
+    analysis = _chat(ANALYSIS_PROMPT.format(content=truncated))
     if not analysis:
-        raise RuntimeError("Ollama가 빈 응답을 반환했습니다.")
+        raise RuntimeError(
+            "Ollama가 빈 응답을 반환했습니다. "
+            "(thinking 모드 모델이 답변을 생성하지 못했을 수 있습니다. 모델/num_predict 설정을 확인하세요.)"
+        )
 
     log("분석 완료")
     return analysis
@@ -145,18 +162,12 @@ def generate_output(content: str, instruction: str) -> str:
 
     truncated = content[:MAX_ANALYSIS_CHARS]
     prompt = CODE_GEN_PROMPT.format(content=truncated, instruction=instruction)
-
-    try:
-        response = ollama.chat(
-            model=OLLAMA_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-        )
-    except Exception as exc:
-        raise RuntimeError(f"Ollama 생성에 실패했습니다: {exc}")
-
-    result = response.get("message", {}).get("content", "").strip()
+    result = _chat(prompt)
     if not result:
-        raise RuntimeError("Ollama가 빈 응답을 반환했습니다.")
+        raise RuntimeError(
+            "Ollama가 빈 응답을 반환했습니다. "
+            "(thinking 모드 모델이 답변을 생성하지 못했을 수 있습니다. 모델/num_predict 설정을 확인하세요.)"
+        )
 
     log("생성 완료")
     return result
