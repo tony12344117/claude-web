@@ -1,11 +1,13 @@
 """웹사이트 스크래핑 및 Ollama 분석 공통 로직.
 
 CLI(analyze.py)와 Streamlit 앱(app.py)이 함께 사용하는 핵심 함수들을 모아둔다.
-정확도를 높이기 위해 두 단계 모두 자체 검증/검토 루프를 거친다:
+정확도를 높이기 위해 두 단계 모두 자체 검증 루프를 거친다:
 - scrape_site(): 스크래핑 결과가 불완전(네비게이션/푸터만 있는 등)해 보이면 재시도.
   최대 MAX_SCRAPE_RETRIES회까지 시도하며, 완전해 보이면 조기 종료한다.
-- generate_output(): 생성된 결과물을 MAX_REVIEW_ITERATIONS회 무조건 반복 검토·개선한다.
-  모델이 "이제 됐다"고 판단해도 중간에 멈추지 않고 정해진 횟수를 전부 채운다.
+- generate_output(): 생성된 결과물을 검증(버그/잘못된 데이터/누락된 데이터 확인)하고,
+  문제가 있으면 하나씩 고쳐서 다시 검증한다. CLEAN_STREAK_REQUIRED회 연속으로
+  문제가 없다고 확인되면 그 결과를 출력하고, 그렇지 못하면 MAX_REVIEW_ITERATIONS회까지
+  계속 검증·수정을 반복한다.
 """
 
 import asyncio
@@ -28,6 +30,7 @@ MAX_SCRAPE_RETRIES = 30
 MIN_CONTENT_LENGTH = 200
 
 MAX_REVIEW_ITERATIONS = 100
+CLEAN_STREAK_REQUIRED = 3
 
 CODE_GEN_PROMPT = """당신은 웹 데이터 추출 및 코드 생성 전문가입니다.
 아래는 웹사이트에서 스크래핑한 원본 콘텐츠와 사용자의 요청입니다.
@@ -46,16 +49,17 @@ CODE_GEN_PROMPT = """당신은 웹 데이터 추출 및 코드 생성 전문가�
 {instruction}
 """
 
-REVIEW_PROMPT = """당신은 방금 아래 [이전 결과물]을 생성했습니다.
-지금부터 [원본 콘텐츠]를 처음부터 끝까지 다시 꼼꼼히 읽고, [이전 결과물]의 모든 문장/코드/데이터 하나하나가
-[원본 콘텐츠]의 실제 내용과 정확히 일치하는지 새로 대조 확인하세요. 이전에 확인했던 내용이라도
-넘겨짚지 말고 [원본 콘텐츠]를 다시 근거로 삼아 재검증하세요.
-[사용자 요청]에 정확히 부합하는지, 빠지거나 잘못되거나 지어낸(원본에 없는) 부분은 없는지 엄격하게 재검토하세요.
+VERIFY_PROMPT = """당신이 방금 생성한 아래 [결과물]을 처음부터 다시 엄격하게 검증하세요.
+이전에 확인했던 내용이라도 넘겨짚지 말고, [원본 콘텐츠]를 처음부터 끝까지 다시 읽고 대조하세요.
 
-- 개선할 부분이 있다면: 개선된 최종 결과물 전체를 출력하고, 맨 첫 줄에 정확히 "REVISED"라고만 쓰세요.
-- 더 이상 개선할 부분이 없다면: [이전 결과물]을 그대로 출력하고, 맨 첫 줄에 정확히 "FINAL"이라고만 쓰세요.
-- 첫 줄 다음, 둘째 줄부터 결과물만 작성하세요. 설명, 인사말, 되묻는 말은 절대 하지 마세요.
-- [이전 결과물]이 코드 블록(```언어\n...\n```)이나 CSV 형식이었다면, 개선된 결과물도 반드시 동일한 형식(같은 코드 펜스 언어 태그 등)을 그대로 유지하세요.
+다음 세 가지를 모두 확인하세요:
+1. 버그나 오류가 있는가? (코드라면 실행되지 않거나 문법이 틀린 부분, CSV라면 형식이 깨진 부분 등)
+2. 사실과 다르거나 지어낸(원본에 없는) 데이터가 있는가?
+3. [사용자 요청]을 처리하는 데 필요한 데이터를 [원본 콘텐츠]에서 놓치거나 빠뜨리지는 않았는가?
+
+- 문제가 하나도 없다면: 정확히 "NONE"이라고만 답하세요.
+- 문제가 하나라도 있다면: 첫 줄에 정확히 "ISSUE"라고 쓰고, 둘째 줄부터 무엇이 문제인지 구체적으로 설명하세요.
+- 그 외의 설명, 인사말, 되묻는 말은 절대 하지 마세요.
 
 [원본 콘텐츠]
 {content}
@@ -63,8 +67,27 @@ REVIEW_PROMPT = """당신은 방금 아래 [이전 결과물]을 생성했습니
 [사용자 요청]
 {instruction}
 
-[이전 결과물]
-{previous_result}
+[결과물]
+{result}
+"""
+
+FIX_PROMPT = """당신이 생성한 아래 [결과물]에서 다음과 같은 문제가 발견되었습니다.
+
+[발견된 문제]
+{issue}
+
+[원본 콘텐츠]와 [사용자 요청]을 다시 참고해서 이 문제를 해결한 결과물 전체를 처음부터 다시 작성하세요.
+[결과물]이 코드 블록(```언어\n...\n```)이나 CSV 형식이었다면, 수정된 결과물도 반드시 동일한 형식을 그대로 유지하세요.
+설명, 인사말, 되묻는 말 없이 수정된 결과물만 출력하세요.
+
+[원본 콘텐츠]
+{content}
+
+[사용자 요청]
+{instruction}
+
+[결과물]
+{result}
 """
 
 CODE_FENCE_PATTERN = re.compile(r"```([a-zA-Z0-9_+-]*)\n(.*?)```", re.DOTALL)
@@ -184,31 +207,46 @@ def _chat(prompt: str) -> str:
     return content
 
 
-def _refine_output(content: str, instruction: str, initial_result: str, on_progress: Callable[[str], None]) -> str:
+def _verify(content: str, instruction: str, result: str) -> str | None:
+    """결과물을 검증한다. 문제가 없으면 None, 응답을 못 받으면 '', 문제가 있으면 그 설명을 반환."""
+    prompt = VERIFY_PROMPT.format(content=content, instruction=instruction, result=result)
+    response = _chat(prompt)
+    if not response:
+        return ""
+    if response.strip().upper().startswith("NONE"):
+        return None
+    return response.strip()
+
+
+def _fix(content: str, instruction: str, result: str, issue: str) -> str:
+    prompt = FIX_PROMPT.format(content=content, instruction=instruction, result=result, issue=issue)
+    fixed = _chat(prompt)
+    return fixed.strip() if fixed else result
+
+
+def _verify_and_fix(content: str, instruction: str, initial_result: str, on_progress: Callable[[str], None]) -> str:
     result = initial_result
+    clean_streak = 0
 
-    # 조기 종료 없이 무조건 MAX_REVIEW_ITERATIONS회를 전부 반복한다.
-    # 모델이 "FINAL"(더 개선할 점 없음)이라고 답해도 멈추지 않고 다음 회차로 넘어간다.
-    for i in range(1, MAX_REVIEW_ITERATIONS + 1):
-        on_progress(f"결과 검토 중... ({i}/{MAX_REVIEW_ITERATIONS})")
+    for attempt in range(1, MAX_REVIEW_ITERATIONS + 1):
+        on_progress(f"검증 중... ({clean_streak}/{CLEAN_STREAK_REQUIRED} 연속 통과, 총 {attempt}/{MAX_REVIEW_ITERATIONS}회)")
+        issue = _verify(content, instruction, result)
 
-        prompt = REVIEW_PROMPT.format(content=content, instruction=instruction, previous_result=result)
-        response_text = _chat(prompt)
-        if not response_text:
-            continue  # 이번 회차 응답이 비어있으면 이전 결과를 유지한 채 다음 회차로
+        if issue is None:
+            clean_streak += 1
+            if clean_streak >= CLEAN_STREAK_REQUIRED:
+                on_progress(f"검증 완료: {CLEAN_STREAK_REQUIRED}회 연속 문제 없음 확인됨")
+                return result
+            continue
 
-        first_line, _, rest = response_text.partition("\n")
-        verdict = first_line.strip().upper()
-        revised = rest.strip()
+        if issue == "":
+            continue  # 검증 응답을 못 받음: 판정 보류하고 스트릭 유지한 채 다음 시도로
 
-        if verdict.startswith(("REVISED", "FINAL")):
-            if revised:
-                result = revised
-        else:
-            # 모델이 형식을 지키지 않은 경우: 응답 전체를 개선된 결과물로 간주
-            result = response_text.strip()
+        clean_streak = 0
+        on_progress(f"문제 발견, 수정 중... ({attempt}/{MAX_REVIEW_ITERATIONS})")
+        result = _fix(content, instruction, result, issue)
 
-    on_progress(f"검토 {MAX_REVIEW_ITERATIONS}회 완료")
+    on_progress(f"경고: 최대 {MAX_REVIEW_ITERATIONS}회까지 시도했지만 완전히 해결하지 못했습니다. 마지막 결과를 사용합니다.")
     return result
 
 
@@ -224,7 +262,7 @@ def generate_output(content: str, instruction: str, on_progress: Callable[[str],
             "(thinking 모드 모델이 답변을 생성하지 못했을 수 있습니다. 모델/num_predict 설정을 확인하세요.)"
         )
 
-    result = _refine_output(truncated, instruction, result, on_progress)
+    result = _verify_and_fix(truncated, instruction, result, on_progress)
 
     on_progress("생성 완료")
     return result
