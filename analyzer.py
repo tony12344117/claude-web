@@ -4,6 +4,8 @@ CLI(analyze.py)와 Streamlit 앱(app.py)이 함께 사용하는 핵심 함수들
 """
 
 import asyncio
+import csv
+import re
 from pathlib import Path
 
 from crawl4ai import AsyncWebCrawler
@@ -13,7 +15,7 @@ import ollama
 OLLAMA_MODEL = "qwen3.6"
 OUTPUT_DIR = Path("output")
 CRAWL_TIMEOUT_SECONDS = 60
-PAGE_LOAD_WAIT_SECONDS = 2
+PAGE_LOAD_WAIT_SECONDS = 2.0
 MAX_ANALYSIS_CHARS = 20000
 
 ANALYSIS_PROMPT = """다음은 웹사이트에서 스크래핑한 콘텐츠입니다. 이 사이트가 무엇을 하는 곳인지, \
@@ -23,6 +25,48 @@ ANALYSIS_PROMPT = """다음은 웹사이트에서 스크래핑한 콘텐츠입�
 --- 스크래핑된 콘텐츠 ---
 {content}
 """
+
+CODE_GEN_PROMPT = """당신은 웹 데이터 추출 및 코드 생성 전문가입니다.
+아래는 웹사이트에서 스크래핑한 원본 콘텐츠와 사용자의 요청입니다.
+사용자의 요청을 정확히 파악해서 그에 맞는 결과물만 생성하세요.
+
+- 코드를 요청하면: 스크래핑된 사이트의 구조/로직/텍스트를 참고해서 실제로 작동하는 완전한 코드를 작성하세요. 설명은 최소화하고 코드 위주로 답하세요.
+- 표/CSV를 요청하면: 정확한 CSV 형식으로 출력하세요.
+- 요약을 요청하면: 핵심만 간결하게 정리하세요.
+
+되묻지 말고 바로 결과물만 생성하세요.
+
+[스크래핑 원본 콘텐츠]
+{content}
+
+[사용자 요청]
+{instruction}
+"""
+
+CODE_FENCE_PATTERN = re.compile(r"```([a-zA-Z0-9_+-]*)\n(.*?)```", re.DOTALL)
+
+LANGUAGE_EXTENSIONS = {
+    "python": "py",
+    "py": "py",
+    "javascript": "js",
+    "js": "js",
+    "typescript": "ts",
+    "ts": "ts",
+    "html": "html",
+    "css": "css",
+    "json": "json",
+    "java": "java",
+    "csharp": "cs",
+    "cs": "cs",
+    "go": "go",
+    "ruby": "rb",
+    "rb": "rb",
+    "php": "php",
+    "sql": "sql",
+    "bash": "sh",
+    "sh": "sh",
+    "shell": "sh",
+}
 
 
 def log(message: str) -> None:
@@ -94,3 +138,61 @@ def save_outputs(raw_content: str, analysis: str) -> tuple[Path, Path]:
     log(f"저장 완료: {analysis_path}")
 
     return raw_path, analysis_path
+
+
+def generate_output(content: str, instruction: str) -> str:
+    log("Ollama로 생성 중...")
+
+    truncated = content[:MAX_ANALYSIS_CHARS]
+    prompt = CODE_GEN_PROMPT.format(content=truncated, instruction=instruction)
+
+    try:
+        response = ollama.chat(
+            model=OLLAMA_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Ollama 생성에 실패했습니다: {exc}")
+
+    result = response.get("message", {}).get("content", "").strip()
+    if not result:
+        raise RuntimeError("Ollama가 빈 응답을 반환했습니다.")
+
+    log("생성 완료")
+    return result
+
+
+def _looks_like_csv(text: str) -> bool:
+    lines = [line for line in text.strip().splitlines() if line.strip()]
+    if len(lines) < 2:
+        return False
+    try:
+        csv.Sniffer().sniff(text[:2000], delimiters=",")
+    except csv.Error:
+        return False
+    return True
+
+
+def save_result(response: str) -> Path:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    match = CODE_FENCE_PATTERN.search(response)
+    if match:
+        lang = match.group(1).strip().lower()
+        code = match.group(2).strip()
+        ext = LANGUAGE_EXTENSIONS.get(lang, "txt")
+        path = OUTPUT_DIR / f"result.{ext}"
+        path.write_text(code + "\n", encoding="utf-8")
+        log(f"저장 완료: {path}")
+        return path
+
+    if _looks_like_csv(response):
+        path = OUTPUT_DIR / "result.csv"
+        path.write_text(response.strip() + "\n", encoding="utf-8")
+        log(f"저장 완료: {path}")
+        return path
+
+    path = OUTPUT_DIR / "result.md"
+    path.write_text(response.strip() + "\n", encoding="utf-8")
+    log(f"저장 완료: {path}")
+    return path
