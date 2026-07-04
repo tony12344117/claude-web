@@ -13,17 +13,20 @@ from crawl4ai import AsyncWebCrawler
 from crawl4ai.async_configs import BrowserConfig, CrawlerRunConfig
 import ollama
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
 OLLAMA_MODEL = "qwen3.6"
 OUTPUT_DIR = Path("output")
 CRAWL_TIMEOUT_SECONDS = 60
 OLLAMA_TIMEOUT_SECONDS = 300
+PAGE_LOAD_WAIT_SECONDS = 2
 
-ANALYSIS_PROMPT = """다음은 어떤 웹사이트를 스크래핑한 마크다운 콘텐츠입니다.
-이 내용을 바탕으로 아래 항목을 한국어로 정리해주세요.
-
-1. 사이트 요약: 이 사이트가 무엇을 하는 곳인지 간결하게 설명
-2. 기술스택 추정: 콘텐츠나 구조에서 유추할 수 있는 주요 기술스택
-3. 핵심 콘텐츠 구조: 페이지의 주요 섹션과 정보 구성을 정리
+ANALYSIS_PROMPT = """다음은 웹사이트에서 스크래핑한 콘텐츠입니다. 이 사이트가 무엇을 하는 곳인지, \
+주요 기능은 무엇인지, 기술적으로 어떤 스택을 쓰는지 한국어로 명확하게 분석 리포트를 작성하세요. \
+되묻지 말고 바로 분석 결과만 출력하세요.
 
 --- 스크래핑된 콘텐츠 ---
 {content}
@@ -37,7 +40,11 @@ def log(message: str) -> None:
 async def scrape_site(url: str) -> str:
     log("스크래핑 중...")
     browser_config = BrowserConfig(headless=True)
-    run_config = CrawlerRunConfig(page_timeout=CRAWL_TIMEOUT_SECONDS * 1000)
+    run_config = CrawlerRunConfig(
+        page_timeout=CRAWL_TIMEOUT_SECONDS * 1000,
+        wait_for="js:() => document.readyState === 'complete'",
+        delay_before_return_html=PAGE_LOAD_WAIT_SECONDS,
+    )
 
     try:
         async with AsyncWebCrawler(config=browser_config) as crawler:
