@@ -2,10 +2,10 @@
 
 CLI(analyze.py)와 Streamlit 앱(app.py)이 함께 사용하는 핵심 함수들을 모아둔다.
 정확도를 높이기 위해 두 단계 모두 자체 검증/검토 루프를 거친다:
-- scrape_site(): 스크래핑 결과가 불완전(네비게이션/푸터만 있는 등)해 보이면 재시도
-- generate_output(): 생성된 결과물을 스스로 검토해 개선점이 없을 때까지 다듬는다
-두 루프 모두 최대 반복 횟수(MAX_SCRAPE_RETRIES/MAX_REVIEW_ITERATIONS)에 도달하거나
-더 이상 개선할 필요가 없다고 판단되면 조기 종료한다.
+- scrape_site(): 스크래핑 결과가 불완전(네비게이션/푸터만 있는 등)해 보이면 재시도.
+  최대 MAX_SCRAPE_RETRIES회까지 시도하며, 완전해 보이면 조기 종료한다.
+- generate_output(): 생성된 결과물을 MAX_REVIEW_ITERATIONS회 무조건 반복 검토·개선한다.
+  모델이 "이제 됐다"고 판단해도 중간에 멈추지 않고 정해진 횟수를 전부 채운다.
 """
 
 import asyncio
@@ -27,7 +27,7 @@ MAX_ANALYSIS_CHARS = 20000
 MAX_SCRAPE_RETRIES = 30
 MIN_CONTENT_LENGTH = 200
 
-MAX_REVIEW_ITERATIONS = 30
+MAX_REVIEW_ITERATIONS = 100
 
 CODE_GEN_PROMPT = """당신은 웹 데이터 추출 및 코드 생성 전문가입니다.
 아래는 웹사이트에서 스크래핑한 원본 콘텐츠와 사용자의 요청입니다.
@@ -47,7 +47,10 @@ CODE_GEN_PROMPT = """당신은 웹 데이터 추출 및 코드 생성 전문가�
 """
 
 REVIEW_PROMPT = """당신은 방금 아래 [이전 결과물]을 생성했습니다.
-[원본 콘텐츠]와 [사용자 요청]에 정확히 부합하는지, 빠지거나 잘못된 부분은 없는지 스스로 엄격하게 재검토하세요.
+지금부터 [원본 콘텐츠]를 처음부터 끝까지 다시 꼼꼼히 읽고, [이전 결과물]의 모든 문장/코드/데이터 하나하나가
+[원본 콘텐츠]의 실제 내용과 정확히 일치하는지 새로 대조 확인하세요. 이전에 확인했던 내용이라도
+넘겨짚지 말고 [원본 콘텐츠]를 다시 근거로 삼아 재검증하세요.
+[사용자 요청]에 정확히 부합하는지, 빠지거나 잘못되거나 지어낸(원본에 없는) 부분은 없는지 엄격하게 재검토하세요.
 
 - 개선할 부분이 있다면: 개선된 최종 결과물 전체를 출력하고, 맨 첫 줄에 정확히 "REVISED"라고만 쓰세요.
 - 더 이상 개선할 부분이 없다면: [이전 결과물]을 그대로 출력하고, 맨 첫 줄에 정확히 "FINAL"이라고만 쓰세요.
@@ -184,29 +187,28 @@ def _chat(prompt: str) -> str:
 def _refine_output(content: str, instruction: str, initial_result: str, on_progress: Callable[[str], None]) -> str:
     result = initial_result
 
+    # 조기 종료 없이 무조건 MAX_REVIEW_ITERATIONS회를 전부 반복한다.
+    # 모델이 "FINAL"(더 개선할 점 없음)이라고 답해도 멈추지 않고 다음 회차로 넘어간다.
     for i in range(1, MAX_REVIEW_ITERATIONS + 1):
         on_progress(f"결과 검토 중... ({i}/{MAX_REVIEW_ITERATIONS})")
 
         prompt = REVIEW_PROMPT.format(content=content, instruction=instruction, previous_result=result)
         response_text = _chat(prompt)
         if not response_text:
-            break  # 검토 응답이 비어있으면 지금까지의 결과를 유지하고 중단
+            continue  # 이번 회차 응답이 비어있으면 이전 결과를 유지한 채 다음 회차로
 
         first_line, _, rest = response_text.partition("\n")
         verdict = first_line.strip().upper()
         revised = rest.strip()
 
-        if verdict.startswith("FINAL"):
-            on_progress(f"검토 완료: {i}회 만에 더 개선할 점 없음으로 판단됨")
-            break
+        if verdict.startswith(("REVISED", "FINAL")):
+            if revised:
+                result = revised
+        else:
+            # 모델이 형식을 지키지 않은 경우: 응답 전체를 개선된 결과물로 간주
+            result = response_text.strip()
 
-        if verdict.startswith("REVISED") and revised:
-            result = revised
-            continue
-
-        # 모델이 형식을 지키지 않은 경우: 응답 전체를 개선된 결과물로 간주하고 계속 검토
-        result = response_text.strip()
-
+    on_progress(f"검토 {MAX_REVIEW_ITERATIONS}회 완료")
     return result
 
 
