@@ -5,12 +5,24 @@
 """
 
 import asyncio
+import inspect
 from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
 
+import analyzer
 from analyzer import log, scrape_site, generate_output, save_result
+
+# 다른 경로의 옛날 analyzer 모듈이 로드되는 문제를 진단할 수 있게 실제 로드 경로를 남긴다.
+log(f"analyzer 모듈 경로: {analyzer.__file__}")
+
+
+def _supports_on_progress(func) -> bool:
+    try:
+        return "on_progress" in inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return False
 
 st.set_page_config(page_title="웹사이트 분석기", page_icon="🔍", layout="wide")
 
@@ -92,8 +104,19 @@ def run_pipeline(url: str, instruction: str) -> tuple[str, str, Path]:
             status.update(label=message)
             log(message)
 
-        raw_content = asyncio.run(scrape_site(url, on_progress=progress))
-        result = generate_output(raw_content, instruction, on_progress=progress)
+        # 옛날 analyzer 모듈(on_progress 미지원)이 로드된 환경에서도 죽지 않도록
+        # 실제 시그니처를 확인한 뒤에만 콜백을 넘긴다.
+        if _supports_on_progress(scrape_site):
+            raw_content = asyncio.run(scrape_site(url, on_progress=progress))
+        else:
+            raw_content = asyncio.run(scrape_site(url))
+
+        if _supports_on_progress(generate_output):
+            result = generate_output(raw_content, instruction, on_progress=progress)
+        else:
+            status.update(label="분석 중...")
+            result = generate_output(raw_content, instruction)
+
         path = save_result(result)
         status.update(label="완료", state="complete")
     file_content = path.read_text(encoding="utf-8")
