@@ -98,7 +98,7 @@ instruction = st.text_area(
 analyze_clicked = st.button("분석하기", type="primary")
 
 
-def run_pipeline(url: str, instruction: str) -> tuple[str, str, Path]:
+def run_pipeline(url: str, instruction: str) -> tuple[str, int, str, Path]:
     with st.status("스크래핑 중...", expanded=True) as status:
         def progress(message: str) -> None:
             status.update(label=message)
@@ -120,7 +120,12 @@ def run_pipeline(url: str, instruction: str) -> tuple[str, str, Path]:
         path = save_result(result)
         status.update(label="완료", state="complete")
     file_content = path.read_text(encoding="utf-8")
-    return raw_content, file_content, path
+
+    # scrape_site()가 ScrapedData를 반환하는 최신 analyzer와 문자열을 반환하는
+    # 옛날 analyzer 모두 지원한다.
+    raw_markdown = getattr(raw_content, "markdown", raw_content)
+    network_count = len(getattr(raw_content, "network_requests", []))
+    return raw_markdown, network_count, file_content, path
 
 
 if analyze_clicked:
@@ -130,14 +135,15 @@ if analyze_clicked:
         st.error("지시문을 입력해주세요.")
     else:
         try:
-            raw_content, file_content, path = run_pipeline(url, instruction)
+            raw_markdown, network_count, file_content, path = run_pipeline(url, instruction)
         except RuntimeError as exc:
             st.error(f"오류: {exc}")
         else:
             entry = {
                 "url": url,
                 "instruction": instruction,
-                "raw_content": raw_content,
+                "raw_content": raw_markdown,
+                "network_count": network_count,
                 "result": file_content,
                 "file_name": path.name,
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -169,6 +175,8 @@ if selected:
         )
 
     with tab_raw:
+        if selected.get("network_count"):
+            st.caption(f"HTTP 네트워크 요청 {selected['network_count']}건 캡처됨 (Ollama가 필요 시 참조)")
         st.markdown(selected["raw_content"])
         st.download_button(
             "원본 콘텐츠 다운로드 (.md)",

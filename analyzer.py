@@ -15,12 +15,22 @@ CLI(analyze.py)와 Streamlit 앱(app.py)이 함께 사용하는 핵심 함수들
 import asyncio
 import csv
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Union
 
 from crawl4ai import AsyncWebCrawler
 from crawl4ai.async_configs import BrowserConfig, CrawlerRunConfig
 import ollama
+
+
+@dataclass
+class ScrapedData:
+    """스크래핑으로 수집한 전체 데이터. Ollama가 이 중 필요한 것만 골라서 사용한다."""
+
+    markdown: str
+    html: str = ""
+    network_requests: list = field(default_factory=list)
 
 OLLAMA_MODEL = "qwen3.6"
 OUTPUT_DIR = Path("output")
@@ -34,8 +44,25 @@ MIN_CONTENT_LENGTH = 200
 MAX_REVIEW_ITERATIONS = 100
 CLEAN_STREAK_REQUIRED = 3
 
-CODE_GEN_PROMPT = """당신은 웹 데이터 추출 및 코드 생성 전문가입니다.
-아래는 웹사이트에서 스크래핑한 원본 콘텐츠와 사용자의 요청입니다.
+SELECT_DATA_PROMPT = """당신은 웹 데이터 추출 및 코드 생성 전문가입니다.
+웹사이트를 스크래핑해서 아래 세 종류의 데이터를 수집해 두었습니다.
+사용자 요청을 처리하는 데 꼭 필요한 데이터만 고르세요.
+
+1. MARKDOWN: 페이지 본문을 마크다운으로 변환한 텍스트 ({markdown_chars}자)
+2. HTML: 페이지 원본 HTML 소스 — 태그 구조, 클래스명, 스크립트 등 포함 ({html_chars}자)
+3. NETWORK: 페이지 로딩 중 발생한 HTTP 네트워크 요청 정보 — URL, 메서드, 헤더, 상태코드 ({network_count}건)
+
+[네트워크 요청 미리보기]
+{network_preview}
+
+[사용자 요청]
+{instruction}
+
+필요한 데이터 이름만 쉼표로 구분해서 한 줄로 답하세요. (예: MARKDOWN 또는 MARKDOWN,NETWORK 또는 HTML)
+다른 설명은 절대 하지 마세요.
+"""
+
+CODE_GEN_PROMPT = """좋습니다. 요청하신 데이터는 아래와 같습니다.
 사용자의 요청을 정확히 파악해서 그에 맞는 결과물만 생성하세요.
 
 - 코드를 요청하면: 스크래핑된 사이트의 구조/로직/텍스트를 참고해서 실제로 작동하는 완전한 코드를 작성하세요. 설명은 최소화하고 코드 위주로 답하세요.
@@ -44,8 +71,7 @@ CODE_GEN_PROMPT = """당신은 웹 데이터 추출 및 코드 생성 전문가�
 
 되묻지 말고 바로 결과물만 생성하세요.
 
-[스크래핑 원본 콘텐츠]
-{content}
+{data_sections}
 
 [사용자 요청]
 {instruction}
@@ -123,8 +149,8 @@ def _looks_incomplete(markdown: str) -> bool:
     return False
 
 
-async def scrape_site(url: str, on_progress: Callable[[str], None] = log) -> str:
-    last_markdown = ""
+async def scrape_site(url: str, on_progress: Callable[[str], None] = log) -> ScrapedData:
+    last_data = None
     last_error = None
 
     for attempt in range(1, MAX_SCRAPE_RETRIES + 1):
@@ -135,6 +161,7 @@ async def scrape_site(url: str, on_progress: Callable[[str], None] = log) -> str
             page_timeout=CRAWL_TIMEOUT_SECONDS * 1000,
             wait_for="js:() => document.readyState === 'complete'",
             delay_before_return_html=PAGE_LOAD_WAIT_SECONDS + (attempt - 1) * 0.5,
+            capture_network_requests=True,
         )
 
         try:
@@ -159,14 +186,23 @@ async def scrape_site(url: str, on_progress: Callable[[str], None] = log) -> str
             last_error = "스크래핑된 콘텐츠가 비어 있습니다."
             continue
 
-        last_markdown = markdown
-        if not _looks_incomplete(markdown):
-            on_progress(f"스크래핑 완료 ({len(markdown)}자, {attempt}번째 시도)")
-            return markdown
+        data = ScrapedData(
+            markdown=markdown,
+            html=result.html or "",
+            network_requests=result.network_requests or [],
+        )
 
-    if last_markdown:
+        last_data = data
+        if not _looks_incomplete(markdown):
+            on_progress(
+                f"스크래핑 완료 (본문 {len(markdown)}자, HTML {len(data.html)}자, "
+                f"네트워크 요청 {len(data.network_requests)}건, {attempt}번째 시도)"
+            )
+            return data
+
+    if last_data:
         on_progress(f"경고: {MAX_SCRAPE_RETRIES}번 재시도했지만 콘텐츠가 불완전할 수 있습니다. 마지막 결과를 사용합니다.")
-        return last_markdown
+        return last_data
 
     raise RuntimeError(last_error or "스크래핑에 실패했습니다.")
 
@@ -245,12 +281,90 @@ def _verify_and_fix(messages: list[dict], initial_result: str, on_progress: Call
     return result
 
 
-def generate_output(content: str, instruction: str, on_progress: Callable[[str], None] = log) -> str:
-    on_progress("Ollama로 생성 중...")
+def _format_network_requests(requests: list, max_entries: int = 100, with_headers: bool = True) -> str:
+    """캡처된 네트워크 요청을 'METHOD URL / 상태 / 헤더' 형태의 텍스트로 정리한다."""
+    lines = []
+    for event in requests[:max_entries]:
+        if not isinstance(event, dict):
+            lines.append(str(event))
+            continue
 
-    truncated = content[:MAX_ANALYSIS_CHARS]
-    initial_prompt = CODE_GEN_PROMPT.format(content=truncated, instruction=instruction)
-    messages = [{"role": "user", "content": initial_prompt}]
+        event_type = event.get("event_type", "")
+        method = event.get("method", "")
+        req_url = event.get("url", "")
+        status = event.get("status", "")
+
+        if event_type == "response":
+            lines.append(f"← {status} {req_url}")
+        else:
+            lines.append(f"→ {method or 'GET'} {req_url}")
+
+        if with_headers:
+            headers = event.get("headers") or {}
+            if isinstance(headers, dict) and headers:
+                for key, value in list(headers.items())[:10]:
+                    lines.append(f"    {key}: {str(value)[:200]}")
+
+    if len(requests) > max_entries:
+        lines.append(f"... (외 {len(requests) - max_entries}건 생략)")
+    return "\n".join(lines)
+
+
+def _parse_data_selection(reply: str) -> set[str]:
+    """데이터 선택 응답에서 MARKDOWN/HTML/NETWORK 키워드를 추출한다. 없으면 MARKDOWN 기본값."""
+    upper = reply.upper()
+    selected = {name for name in ("MARKDOWN", "HTML", "NETWORK") if name in upper}
+    return selected or {"MARKDOWN"}
+
+
+def _build_data_sections(scraped: ScrapedData, selected: set[str]) -> str:
+    """선택된 데이터 소스만 모아 프롬프트에 넣을 본문을 만든다. 전체 분량은 MAX_ANALYSIS_CHARS로 제한."""
+    budget_per_source = MAX_ANALYSIS_CHARS // len(selected)
+    sections = []
+
+    if "MARKDOWN" in selected:
+        sections.append(f"[페이지 본문 (마크다운)]\n{scraped.markdown[:budget_per_source]}")
+    if "HTML" in selected:
+        sections.append(f"[페이지 원본 HTML 소스]\n{scraped.html[:budget_per_source]}")
+    if "NETWORK" in selected:
+        network_text = _format_network_requests(scraped.network_requests)
+        sections.append(f"[HTTP 네트워크 요청 정보]\n{network_text[:budget_per_source]}")
+
+    return "\n\n".join(sections)
+
+
+def generate_output(
+    content: Union[ScrapedData, str],
+    instruction: str,
+    on_progress: Callable[[str], None] = log,
+) -> str:
+    # 옛날 호출부(문자열만 넘기는 경우)와의 호환: 마크다운만 있는 ScrapedData로 감싼다.
+    scraped = content if isinstance(content, ScrapedData) else ScrapedData(markdown=str(content))
+
+    # 1단계: 수집된 데이터 목록을 보여주고, Ollama가 필요한 것만 고르게 한다.
+    on_progress("필요한 데이터 선택 중...")
+    network_preview = _format_network_requests(scraped.network_requests, max_entries=15, with_headers=False)
+    select_prompt = SELECT_DATA_PROMPT.format(
+        markdown_chars=len(scraped.markdown),
+        html_chars=len(scraped.html),
+        network_count=len(scraped.network_requests),
+        network_preview=network_preview or "(캡처된 네트워크 요청 없음)",
+        instruction=instruction,
+    )
+    messages = [{"role": "user", "content": select_prompt}]
+    selection_reply = _chat_turn(messages)
+    if selection_reply:
+        messages.append({"role": "assistant", "content": selection_reply})
+    else:
+        messages.pop()  # 선택 응답을 못 받으면 이 턴은 버리고 기본값(MARKDOWN)으로 진행
+    selected = _parse_data_selection(selection_reply or "")
+    on_progress(f"선택된 데이터: {', '.join(sorted(selected))}")
+
+    # 2단계: 선택된 데이터만 대화에 넣고 결과물을 생성한다.
+    on_progress("Ollama로 생성 중...")
+    data_sections = _build_data_sections(scraped, selected)
+    gen_prompt = CODE_GEN_PROMPT.format(data_sections=data_sections, instruction=instruction)
+    messages.append({"role": "user", "content": gen_prompt})
     result = _chat_turn(messages)
     if not result:
         raise RuntimeError(
@@ -259,6 +373,7 @@ def generate_output(content: str, instruction: str, on_progress: Callable[[str],
         )
     messages.append({"role": "assistant", "content": result})
 
+    # 3단계: 같은 대화 맥락에서 검증·수정 반복.
     result = _verify_and_fix(messages, result, on_progress)
 
     on_progress("생성 완료")
