@@ -8,6 +8,8 @@ CLI(analyze.py)와 Streamlit 앱(app.py)이 함께 사용하는 핵심 함수들
   문제가 있으면 하나씩 고쳐서 다시 검증한다. CLEAN_STREAK_REQUIRED회 연속으로
   문제가 없다고 확인되면 그 결과를 출력하고, 그렇지 못하면 MAX_REVIEW_ITERATIONS회까지
   계속 검증·수정을 반복한다.
+  매번 원본 콘텐츠를 새 프롬프트에 다시 붙여넣는 대신, Ollama와의 대화(messages)를
+  하나로 유지해서 같은 맥락(기억)이 남은 상태에서 후속 질문만 이어서 묻는다.
 """
 
 import asyncio
@@ -49,45 +51,29 @@ CODE_GEN_PROMPT = """당신은 웹 데이터 추출 및 코드 생성 전문가�
 {instruction}
 """
 
-VERIFY_PROMPT = """당신이 방금 생성한 아래 [결과물]을 처음부터 다시 엄격하게 검증하세요.
-이전에 확인했던 내용이라도 넘겨짚지 말고, [원본 콘텐츠]를 처음부터 끝까지 다시 읽고 대조하세요.
+VERIFY_PROMPT = """방금 당신이 만든 결과물을 처음부터 다시 엄격하게 검증하세요.
+이전에 확인했던 내용이라도 넘겨짚지 말고, 대화 맨 처음에 주어졌던 원본 콘텐츠와 사용자 요청을
+처음부터 다시 읽고 대조하세요.
 
 다음 세 가지를 모두 확인하세요:
 1. 버그나 오류가 있는가? (코드라면 실행되지 않거나 문법이 틀린 부분, CSV라면 형식이 깨진 부분 등)
 2. 사실과 다르거나 지어낸(원본에 없는) 데이터가 있는가?
-3. [사용자 요청]을 처리하는 데 필요한 데이터를 [원본 콘텐츠]에서 놓치거나 빠뜨리지는 않았는가?
+3. 사용자 요청을 처리하는 데 필요한 데이터를 원본 콘텐츠에서 놓치거나 빠뜨리지는 않았는가?
 
 - 문제가 하나도 없다면: 정확히 "NONE"이라고만 답하세요.
 - 문제가 하나라도 있다면: 첫 줄에 정확히 "ISSUE"라고 쓰고, 둘째 줄부터 무엇이 문제인지 구체적으로 설명하세요.
 - 그 외의 설명, 인사말, 되묻는 말은 절대 하지 마세요.
-
-[원본 콘텐츠]
-{content}
-
-[사용자 요청]
-{instruction}
-
-[결과물]
-{result}
 """
 
-FIX_PROMPT = """당신이 생성한 아래 [결과물]에서 다음과 같은 문제가 발견되었습니다.
+FIX_PROMPT = """방금 지적한 아래 문제를 해결하세요.
 
 [발견된 문제]
 {issue}
 
-[원본 콘텐츠]와 [사용자 요청]을 다시 참고해서 이 문제를 해결한 결과물 전체를 처음부터 다시 작성하세요.
-[결과물]이 코드 블록(```언어\n...\n```)이나 CSV 형식이었다면, 수정된 결과물도 반드시 동일한 형식을 그대로 유지하세요.
+대화 맨 처음에 주어졌던 원본 콘텐츠와 사용자 요청을 다시 참고해서, 이 문제를 해결한 결과물
+전체를 처음부터 다시 작성하세요. 방금 전 결과물이 코드 블록(```언어\n...\n```)이나 CSV
+형식이었다면, 수정된 결과물도 반드시 동일한 형식을 그대로 유지하세요.
 설명, 인사말, 되묻는 말 없이 수정된 결과물만 출력하세요.
-
-[원본 콘텐츠]
-{content}
-
-[사용자 요청]
-{instruction}
-
-[결과물]
-{result}
 """
 
 CODE_FENCE_PATTERN = re.compile(r"```([a-zA-Z0-9_+-]*)\n(.*?)```", re.DOTALL)
@@ -185,9 +171,7 @@ async def scrape_site(url: str, on_progress: Callable[[str], None] = log) -> str
     raise RuntimeError(last_error or "스크래핑에 실패했습니다.")
 
 
-def _chat(prompt: str) -> str:
-    messages = [{"role": "user", "content": prompt}]
-
+def _chat_turn(messages: list[dict]) -> str:
     try:
         try:
             # qwen3 계열처럼 hybrid thinking을 지원하는 모델은 think=False로 꺼야
@@ -207,10 +191,21 @@ def _chat(prompt: str) -> str:
     return content
 
 
-def _verify(content: str, instruction: str, result: str) -> str | None:
+def _ask(messages: list[dict], prompt: str) -> str:
+    """messages에 새 user 턴을 추가해 같은 대화 맥락 안에서 다시 묻고, 응답을 대화 이력에 반영한다."""
+    messages.append({"role": "user", "content": prompt})
+    reply = _chat_turn(messages)
+    if reply:
+        messages.append({"role": "assistant", "content": reply})
+    else:
+        # 빈 응답이면 이번 user 턴은 대화 이력에서 되돌려 다음 시도에 영향을 주지 않게 한다.
+        messages.pop()
+    return reply
+
+
+def _verify(messages: list[dict]) -> str | None:
     """결과물을 검증한다. 문제가 없으면 None, 응답을 못 받으면 '', 문제가 있으면 그 설명을 반환."""
-    prompt = VERIFY_PROMPT.format(content=content, instruction=instruction, result=result)
-    response = _chat(prompt)
+    response = _ask(messages, VERIFY_PROMPT)
     if not response:
         return ""
     if response.strip().upper().startswith("NONE"):
@@ -218,19 +213,17 @@ def _verify(content: str, instruction: str, result: str) -> str | None:
     return response.strip()
 
 
-def _fix(content: str, instruction: str, result: str, issue: str) -> str:
-    prompt = FIX_PROMPT.format(content=content, instruction=instruction, result=result, issue=issue)
-    fixed = _chat(prompt)
-    return fixed.strip() if fixed else result
+def _fix(messages: list[dict], issue: str) -> str:
+    return _ask(messages, FIX_PROMPT.format(issue=issue))
 
 
-def _verify_and_fix(content: str, instruction: str, initial_result: str, on_progress: Callable[[str], None]) -> str:
+def _verify_and_fix(messages: list[dict], initial_result: str, on_progress: Callable[[str], None]) -> str:
     result = initial_result
     clean_streak = 0
 
     for attempt in range(1, MAX_REVIEW_ITERATIONS + 1):
         on_progress(f"검증 중... ({clean_streak}/{CLEAN_STREAK_REQUIRED} 연속 통과, 총 {attempt}/{MAX_REVIEW_ITERATIONS}회)")
-        issue = _verify(content, instruction, result)
+        issue = _verify(messages)
 
         if issue is None:
             clean_streak += 1
@@ -244,7 +237,9 @@ def _verify_and_fix(content: str, instruction: str, initial_result: str, on_prog
 
         clean_streak = 0
         on_progress(f"문제 발견, 수정 중... ({attempt}/{MAX_REVIEW_ITERATIONS})")
-        result = _fix(content, instruction, result, issue)
+        fixed = _fix(messages, issue)
+        if fixed:
+            result = fixed
 
     on_progress(f"경고: 최대 {MAX_REVIEW_ITERATIONS}회까지 시도했지만 완전히 해결하지 못했습니다. 마지막 결과를 사용합니다.")
     return result
@@ -254,15 +249,17 @@ def generate_output(content: str, instruction: str, on_progress: Callable[[str],
     on_progress("Ollama로 생성 중...")
 
     truncated = content[:MAX_ANALYSIS_CHARS]
-    prompt = CODE_GEN_PROMPT.format(content=truncated, instruction=instruction)
-    result = _chat(prompt)
+    initial_prompt = CODE_GEN_PROMPT.format(content=truncated, instruction=instruction)
+    messages = [{"role": "user", "content": initial_prompt}]
+    result = _chat_turn(messages)
     if not result:
         raise RuntimeError(
             "Ollama가 빈 응답을 반환했습니다. "
             "(thinking 모드 모델이 답변을 생성하지 못했을 수 있습니다. 모델/num_predict 설정을 확인하세요.)"
         )
+    messages.append({"role": "assistant", "content": result})
 
-    result = _verify_and_fix(truncated, instruction, result, on_progress)
+    result = _verify_and_fix(messages, result, on_progress)
 
     on_progress("생성 완료")
     return result
